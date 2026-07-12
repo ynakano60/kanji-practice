@@ -1,5 +1,5 @@
 // オフライン対応(N-3): アプリ本体をキャッシュする。デプロイ時は CACHE_VERSION を上げること。
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const CACHE_NAME = 'kanji-practice-' + CACHE_VERSION;
 const APP_SHELL = [
   './',

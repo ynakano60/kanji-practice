@@ -1,6 +1,6 @@
 import { getAllSets, getSet, putSet, deleteSet } from './db.js';
 import { parseOcrText } from './parser.js';
-import { getApiKey, setApiKey, fileToResizedBase64, extractFromImage } from './api.js';
+import { getApiKey, setApiKey, getGeminiKey, setGeminiKey, availableEngines, fileToResizedBase64, extractFromImage } from './api.js';
 
 const app = document.getElementById('app');
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2));
@@ -110,7 +110,7 @@ function renderImportMenu() {
     ${header('問題の取り込み', '#home')}
     <div class="screen">
       <button class="btn" onclick="location.hash='#import-photo'">📷 写真から取り込む(AI)</button>
-      <p class="muted">プリントを撮影すると、AIが問題と正解を自動で読み取ります。APIキーの設定が必要です。</p>
+      <p class="muted">プリントを撮影すると、AIが問題と正解を自動で読み取ります。無料の Gemini APIキー(または Claude APIキー)の設定が必要です。</p>
       <button class="btn secondary" onclick="location.hash='#import-ocr'">📋 テキスト貼り付けで取り込む</button>
       <p class="muted">スマホのカメラのテキスト認識(iPhoneのテキスト認識表示 / Googleレンズ)でコピーした文字を貼り付けます。キー不要・無料。</p>
       <button class="btn secondary" id="manual-btn">✏️ 手入力で作る</button>
@@ -124,16 +124,23 @@ function renderImportMenu() {
 
 // ===== 写真取り込み(F-1) =====
 function renderPhotoImport() {
-  const hasKey = !!getApiKey();
+  const engines = availableEngines();
+  const engineSelect = engines.length > 1 ? `
+    <div class="card">
+      <label class="field">読み取りに使うAI</label>
+      <select id="engine-select">${engines.map(e => `<option value="${e.id}">${esc(e.label)}</option>`).join('')}</select>
+    </div>` : '';
+
   app.innerHTML = `
     ${header('写真から取り込む', '#import')}
     <div class="screen">
-      ${hasKey ? '' : `<div class="card">
+      ${engines.length > 0 ? '' : `<div class="card">
         <p class="error-msg">APIキーが未設定です。</p>
-        <p class="muted">写真の自動読み取りには Anthropic APIキーが必要です(写真1枚あたり数円)。</p>
+        <p class="muted">写真の自動読み取りには AI のAPIキーが必要です。<b>Google Gemini なら無料</b>で使えます(設定画面に取得方法があります)。</p>
         <button class="btn small secondary" onclick="location.hash='#settings'">設定画面へ</button>
         <p class="muted" style="margin-top:8px">キーなしで使う場合は「テキスト貼り付けで取り込む」をどうぞ。</p>
       </div>`}
+      ${engineSelect}
       <label class="btn secondary" for="photo-input">📷 プリントを撮影 / 写真を選ぶ</label>
       <input type="file" id="photo-input" accept="image/*" capture="environment" style="display:none">
       <img id="photo-preview" style="display:none" alt="プレビュー">
@@ -152,18 +159,20 @@ function renderPhotoImport() {
     if (selectedFile) {
       preview.src = URL.createObjectURL(selectedFile);
       preview.style.display = 'block';
-      extractBtn.disabled = !getApiKey();
-      if (!getApiKey()) status.innerHTML = '<p class="error-msg">APIキーを設定すると読み取りできます。</p>';
+      extractBtn.disabled = engines.length === 0;
+      if (engines.length === 0) status.innerHTML = '<p class="error-msg">APIキーを設定すると読み取りできます。</p>';
     }
   };
 
   extractBtn.onclick = async () => {
     if (!selectedFile) return;
+    const sel = document.getElementById('engine-select');
+    const engine = sel ? sel.value : (engines[0] && engines[0].id);
     extractBtn.disabled = true;
     status.innerHTML = '<div class="spinner"></div><p class="muted" style="text-align:center">読み取り中…(30秒ほどかかることがあります)</p>';
     try {
       const base64 = await fileToResizedBase64(selectedFile);
-      const questions = await extractFromImage(base64);
+      const questions = await extractFromImage(base64, engine);
       draft = { setId: null, title: '', category: '', testDate: '', questions };
       location.hash = '#editor';
     } catch (e) {
@@ -419,8 +428,22 @@ async function renderPractice() {
       </div>
     </div>`;
 
-  // 手書きキャンバス初期化
+  // マスを画面の幅・高さに合わせてできるだけ大きく表示する(1行あたり最大2マス)
   const canvases = [...app.querySelectorAll('canvas.cell')];
+  const writeArea = app.querySelector('.write-area');
+  const n = canvases.length;
+  const perRow = Math.min(n, 2);
+  const rows = Math.ceil(n / perRow);
+  const availW = writeArea.clientWidth - 28;
+  const availH = writeArea.clientHeight - rows * 34 - 14; // 「このマスを消す」ボタン分を差し引く
+  const size = Math.max(130, Math.min(
+    Math.floor((availW - (perRow - 1) * 10) / perRow),
+    Math.floor(availH / rows),
+    340
+  ));
+  canvases.forEach(c => { c.style.width = size + 'px'; c.style.height = size + 'px'; });
+
+  // 手書きキャンバス初期化
   canvases.forEach(setupCanvas);
 
   app.querySelectorAll('.cell-clear').forEach(btn => {
@@ -464,7 +487,7 @@ function setupCanvas(canvas) {
   canvas.height = rect.height * dpr;
   const ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
-  ctx.lineWidth = 6;
+  ctx.lineWidth = Math.max(6, Math.round(rect.width / 22)); // マスが大きいほど線も太く
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.strokeStyle = '#1f2937';
@@ -574,12 +597,28 @@ async function renderSettings() {
     ${header('設定', '#home')}
     <div class="screen">
       <div class="card">
-        <label class="field">Anthropic APIキー(写真の自動読み取りに使用)</label>
+        <p style="margin-bottom:8px"><b>写真の自動読み取り(AI)</b></p>
+        <p class="muted">どちらか一方のキーを設定すれば使えます。キーはこの端末の中にだけ保存されます。キーがなくても、貼り付け取り込み・手入力・練習は全部使えます。</p>
+
+        <label class="field" style="margin-top:12px">Google Gemini APIキー(無料枠あり・おすすめ)</label>
+        <input type="password" id="gemini-key" value="${esc(getGeminiKey())}" placeholder="AIza...">
+        <details class="help" style="margin-top:4px">
+          <summary>無料キーの取り方</summary>
+          <ol>
+            <li><a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a> を開く</li>
+            <li>Google アカウントでログイン</li>
+            <li>「APIキーを作成」を押してキーをコピー</li>
+            <li>上の欄に貼り付けて保存</li>
+          </ol>
+          <p class="muted">クレジットカード不要。無料枠内なら費用はかかりません。</p>
+        </details>
+
+        <label class="field" style="margin-top:12px">Anthropic Claude APIキー(有料・写真1枚あたり数円)</label>
         <input type="password" id="api-key" value="${esc(getApiKey())}" placeholder="sk-ant-...">
-        <p class="muted" style="margin-top:6px">キーはこの端末の中にだけ保存されます。キーがなくても、貼り付け取り込み・手入力・練習は全部使えます。</p>
-        <div class="row" style="margin-top:8px">
+
+        <div class="row" style="margin-top:10px">
           <button class="btn small" id="save-key">保存</button>
-          <button class="btn small ghost" id="clear-key">削除</button>
+          <button class="btn small ghost" id="clear-key">両方削除</button>
         </div>
         <p class="muted" id="key-status"></p>
       </div>
@@ -597,11 +636,14 @@ async function renderSettings() {
 
   const keyStatus = document.getElementById('key-status');
   document.getElementById('save-key').onclick = () => {
+    setGeminiKey(document.getElementById('gemini-key').value.trim());
     setApiKey(document.getElementById('api-key').value.trim());
     keyStatus.textContent = '保存しました。';
   };
   document.getElementById('clear-key').onclick = () => {
+    setGeminiKey('');
     setApiKey('');
+    document.getElementById('gemini-key').value = '';
     document.getElementById('api-key').value = '';
     keyStatus.textContent = '削除しました。';
   };
