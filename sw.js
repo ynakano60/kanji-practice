@@ -1,5 +1,6 @@
 // オフライン対応(N-3): アプリ本体をキャッシュする。デプロイ時は CACHE_VERSION を上げること。
-const CACHE_VERSION = 'v3';
+// 配信方式はネットワーク優先(オンライン時は常に最新、オフライン時のみキャッシュ)。
+const CACHE_VERSION = 'v4';
 const CACHE_NAME = 'kanji-practice-' + CACHE_VERSION;
 const APP_SHELL = [
   './',
@@ -34,16 +35,15 @@ self.addEventListener('fetch', (event) => {
   // API 呼び出しなど別オリジンはキャッシュしない
   if (event.request.method !== 'GET' || url.origin !== location.origin) return;
 
+  // ネットワーク優先: オンラインなら常に最新のファイルを使い、キャッシュを更新。
+  // オフラインのときだけキャッシュから返す。
   event.respondWith(
-    caches.match(event.request, { ignoreSearch: true }).then(cached => {
-      const fetched = fetch(event.request).then(res => {
-        if (res.ok) {
-          const clone = res.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
-        }
-        return res;
-      }).catch(() => cached);
-      return cached || fetched;
-    })
+    fetch(event.request).then(res => {
+      if (res.ok) {
+        const clone = res.clone();
+        caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+      }
+      return res;
+    }).catch(() => caches.match(event.request, { ignoreSearch: true }))
   );
 });

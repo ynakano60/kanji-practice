@@ -2,6 +2,7 @@ import { getAllSets, getSet, putSet, deleteSet } from './db.js';
 import { parseOcrText } from './parser.js';
 import { getApiKey, setApiKey, getGeminiKey, setGeminiKey, availableEngines, fileToResizedBase64, extractFromImage } from './api.js';
 
+const APP_VERSION = 'v4';
 const app = document.getElementById('app');
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2));
 
@@ -632,6 +633,7 @@ async function renderSettings() {
         </div>
         <p class="muted" id="backup-status"></p>
       </div>
+      <p class="muted" style="text-align:center">アプリバージョン: ${APP_VERSION}</p>
     </div>`;
 
   const keyStatus = document.getElementById('key-status');
