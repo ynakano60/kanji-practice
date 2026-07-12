@@ -4,8 +4,7 @@
 
 const CLAUDE_URL = 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODEL = 'claude-opus-4-8';
-const GEMINI_MODEL = 'gemini-2.5-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 const EXTRACT_SCHEMA = {
   type: 'object',
@@ -102,42 +101,99 @@ export async function extractFromImage(base64Jpeg, engine = 'gemini') {
 }
 
 // ===== Google Gemini(無料枠あり・キーは https://aistudio.google.com/ で取得) =====
+// モデル名は決め打ちにせず、このキーで使える最新の flash 系モデルを自動選択する。
+// (Google はモデルの提供を予告なく打ち切るため。404 が出たら次の候補を試す)
+
+async function listGeminiCandidates(apiKey) {
+  const res = await fetch(`${GEMINI_BASE}/models?pageSize=1000`, {
+    headers: { 'x-goog-api-key': apiKey },
+  });
+  if (!res.ok) throw await geminiError(res);
+  const data = await res.json();
+  const names = (data.models || [])
+    .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
+    .map(m => (m.name || '').replace(/^models\//, ''))
+    .filter(n => /^gemini-[\d.]+-flash/.test(n));
+  // 新しいバージョンを優先。lite/8b(小型)や preview/exp(実験版)は後回し
+  const score = n => {
+    const ver = parseFloat((n.match(/^gemini-([\d.]+)/) || [])[1] || '0');
+    let s = ver * 100;
+    if (/lite|8b/.test(n)) s -= 20;
+    if (/preview|exp/.test(n)) s -= 5;
+    if (/^gemini-[\d.]+-flash$/.test(n)) s += 3; // 素の flash 名を優先
+    return s;
+  };
+  return [...new Set(names)].sort((a, b) => score(b) - score(a));
+}
+
+async function geminiError(res) {
+  let detail = '';
+  try {
+    const err = await res.json();
+    detail = err?.error?.message || '';
+  } catch { /* ignore */ }
+  if ((res.status === 400 || res.status === 403) && /API key/i.test(detail)) {
+    return new Error('Gemini APIキーが正しくありません。設定画面で確認してください。');
+  }
+  if (res.status === 429) {
+    return new Error('無料枠の上限に達したか、アクセスが集中しています。1分ほど待ってからもう一度お試しください。');
+  }
+  return new Error(`読み取りに失敗しました (${res.status}) ${detail}`);
+}
+
 async function extractWithGemini(base64Jpeg) {
   const apiKey = getGeminiKey();
   if (!apiKey) throw new Error('Gemini APIキーが設定されていません。設定画面で登録してください。');
 
-  const res = await fetch(GEMINI_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-goog-api-key': apiKey,
-    },
-    body: JSON.stringify({
-      contents: [{
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
-          { text: EXTRACT_PROMPT },
-        ],
-      }],
-      generationConfig: { responseMimeType: 'application/json' },
-    }),
+  const body = JSON.stringify({
+    contents: [{
+      parts: [
+        { inlineData: { mimeType: 'image/jpeg', data: base64Jpeg } },
+        { text: EXTRACT_PROMPT },
+      ],
+    }],
+    generationConfig: { responseMimeType: 'application/json' },
   });
 
-  if (!res.ok) {
-    let detail = '';
-    try {
-      const err = await res.json();
-      detail = err?.error?.message || '';
-    } catch { /* ignore */ }
-    if (res.status === 400 && /API key/i.test(detail)) throw new Error('Gemini APIキーが正しくありません。設定画面で確認してください。');
-    if (res.status === 429) throw new Error('無料枠の上限に達したか、アクセスが集中しています。1分ほど待ってからもう一度お試しください。');
-    throw new Error(`読み取りに失敗しました (${res.status}) ${detail}`);
-  }
+  // 前回成功したモデル → だめなら使えるモデルを探して順に試す
+  const tried = new Set();
+  let candidates = [];
+  const cached = localStorage.getItem('kp_geminiModel');
+  if (cached) candidates.push(cached);
+  let discovered = false;
+  let lastErr = new Error('使えるGeminiモデルが見つかりませんでした。時間をおいてお試しください。');
 
-  const data = await res.json();
-  const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
-  if (!text) throw new Error('読み取り結果が空でした。もう一度お試しください。');
-  return toQuestions(parseJsonLoose(text));
+  while (true) {
+    if (candidates.length === 0) {
+      if (discovered) break;
+      discovered = true;
+      candidates = (await listGeminiCandidates(apiKey)).filter(m => !tried.has(m)).slice(0, 4);
+      if (candidates.length === 0) break;
+    }
+    const model = candidates.shift();
+    tried.add(model);
+
+    const res = await fetch(`${GEMINI_BASE}/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey },
+      body,
+    });
+
+    if (res.status === 404) {
+      // このモデルは使えない(提供終了など)→ 次の候補へ
+      if (cached === model) localStorage.removeItem('kp_geminiModel');
+      lastErr = await geminiError(res);
+      continue;
+    }
+    if (!res.ok) throw await geminiError(res);
+
+    localStorage.setItem('kp_geminiModel', model);
+    const data = await res.json();
+    const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
+    if (!text) throw new Error('読み取り結果が空でした。もう一度お試しください。');
+    return toQuestions(parseJsonLoose(text));
+  }
+  throw lastErr;
 }
 
 // ===== Anthropic Claude =====

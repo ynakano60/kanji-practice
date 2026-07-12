@@ -1,5 +1,4 @@
-// オフライン対応(N-3): アプリ本体をキャッシュする。デプロイ時は CACHE_VERSION を上げること。
-const CACHE_VERSION = 'v2';
+﻿// 繧ｪ繝輔Λ繧､繝ｳ蟇ｾ蠢・N-3): 繧｢繝励Μ譛ｬ菴薙ｒ繧ｭ繝｣繝・す繝･縺吶ｋ縲ゅョ繝励Ο繧､譎ゅ・ CACHE_VERSION 繧剃ｸ翫￡繧九％縺ｨ縲・const CACHE_VERSION = 'v3';
 const CACHE_NAME = 'kanji-practice-' + CACHE_VERSION;
 const APP_SHELL = [
   './',
@@ -31,8 +30,7 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  // API 呼び出しなど別オリジンはキャッシュしない
-  if (event.request.method !== 'GET' || url.origin !== location.origin) return;
+  // API 蜻ｼ縺ｳ蜃ｺ縺励↑縺ｩ蛻･繧ｪ繝ｪ繧ｸ繝ｳ縺ｯ繧ｭ繝｣繝・す繝･縺励↑縺・  if (event.request.method !== 'GET' || url.origin !== location.origin) return;
 
   event.respondWith(
     caches.match(event.request, { ignoreSearch: true }).then(cached => {
