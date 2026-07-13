@@ -2,7 +2,7 @@ import { getAllSets, getSet, putSet, deleteSet } from './db.js';
 import { parseOcrText } from './parser.js';
 import { getApiKey, setApiKey, getGeminiKey, setGeminiKey, availableEngines, fileToResizedBase64, extractFromImage } from './api.js';
 
-const APP_VERSION = 'v4';
+const APP_VERSION = 'v5';
 const app = document.getElementById('app');
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(16).slice(2));
 
@@ -405,13 +405,7 @@ async function renderPractice() {
   const q = set.questions.find(x => x.id === session.qids[session.idx]);
   if (!q) { session.idx++; saveSession(session); renderPractice(); return; }
 
-  const chars = [...q.answer];
-  const cellsHTML = chars.map((_, i) => `
-    <div class="cell-wrap">
-      <canvas class="cell" data-i="${i}"></canvas>
-      <button class="cell-clear" data-i="${i}">このマスを消す</button>
-    </div>`).join('');
-
+  // 文字数がヒントにならないよう、マスは出さず1枚の大きな手書きスペースに自由に書く
   app.innerHTML = `
     ${header(set.title, null, `<button class="head-btn" id="quit-btn">やめる</button>`)}
     <div class="practice">
@@ -421,36 +415,28 @@ async function renderPractice() {
         <div class="answer-line" id="answer-line"></div>
       </div>
       <div class="write-area">
-        <div class="cells">${cellsHTML}</div>
+        <canvas id="pad" class="pad"></canvas>
       </div>
       <div class="practice-btns" id="practice-btns">
-        <button class="btn secondary" id="clear-all">全部消す</button>
+        <div class="row">
+          <button class="btn secondary" id="undo-btn">↩ 一画もどす</button>
+          <button class="btn secondary" id="clear-all">全部消す</button>
+        </div>
         <button class="btn" id="reveal-btn">答えを見る</button>
       </div>
     </div>`;
 
-  // マスを画面の幅・高さに合わせてできるだけ大きく表示する(1行あたり最大2マス)
-  const canvases = [...app.querySelectorAll('canvas.cell')];
+  // 手書きスペースを画面いっぱいに広げる
   const writeArea = app.querySelector('.write-area');
-  const n = canvases.length;
-  const perRow = Math.min(n, 2);
-  const rows = Math.ceil(n / perRow);
-  const availW = writeArea.clientWidth - 28;
-  const availH = writeArea.clientHeight - rows * 34 - 14; // 「このマスを消す」ボタン分を差し引く
-  const size = Math.max(130, Math.min(
-    Math.floor((availW - (perRow - 1) * 10) / perRow),
-    Math.floor(availH / rows),
-    340
-  ));
-  canvases.forEach(c => { c.style.width = size + 'px'; c.style.height = size + 'px'; });
+  const pad = document.getElementById('pad');
+  const padW = writeArea.clientWidth - 28;
+  const padH = Math.max(200, Math.min(writeArea.clientHeight - 20, 360));
+  pad.style.width = padW + 'px';
+  pad.style.height = padH + 'px';
+  setupPad(pad);
 
-  // 手書きキャンバス初期化
-  canvases.forEach(setupCanvas);
-
-  app.querySelectorAll('.cell-clear').forEach(btn => {
-    btn.onclick = () => clearCanvas(canvases[parseInt(btn.dataset.i, 10)]);
-  });
-  document.getElementById('clear-all').onclick = () => canvases.forEach(clearCanvas);
+  document.getElementById('undo-btn').onclick = () => padUndo(pad);
+  document.getElementById('clear-all').onclick = () => padClear(pad);
 
   document.getElementById('quit-btn').onclick = () => {
     location.hash = '#set/' + encodeURIComponent(set.id);
@@ -481,36 +467,36 @@ async function renderPractice() {
   }
 }
 
-function setupCanvas(canvas) {
+// ===== 手書きスペース(1枚キャンバス+画数単位のもどす機能) =====
+function setupPad(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   canvas.width = rect.width * dpr;
   canvas.height = rect.height * dpr;
   const ctx = canvas.getContext('2d');
   ctx.scale(dpr, dpr);
-  ctx.lineWidth = Math.max(6, Math.round(rect.width / 22)); // マスが大きいほど線も太く
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.strokeStyle = '#1f2937';
-  drawGuides(canvas, ctx);
+  canvas._ctx = ctx;
+  canvas._size = { w: rect.width, h: rect.height };
+  canvas._strokes = [];
+  redrawPad(canvas);
 
-  let drawing = false;
+  let current = null;
   canvas.addEventListener('pointerdown', e => {
-    drawing = true;
     canvas.setPointerCapture(e.pointerId);
     const p = pos(e);
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y);
-    ctx.lineTo(p.x + 0.1, p.y + 0.1);
-    ctx.stroke();
+    current = [p];
+    drawSegment(canvas, p, p);
   });
   canvas.addEventListener('pointermove', e => {
-    if (!drawing) return;
+    if (!current) return;
     const p = pos(e);
-    ctx.lineTo(p.x, p.y);
-    ctx.stroke();
+    drawSegment(canvas, current[current.length - 1], p);
+    current.push(p);
   });
-  const stop = () => { drawing = false; };
+  const stop = () => {
+    if (current) canvas._strokes.push(current);
+    current = null;
+  };
   canvas.addEventListener('pointerup', stop);
   canvas.addEventListener('pointercancel', stop);
 
@@ -520,26 +506,55 @@ function setupCanvas(canvas) {
   }
 }
 
-function drawGuides(canvas, ctx) {
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.width / dpr;
-  const h = canvas.height / dpr;
+function penStyle(canvas) {
+  const ctx = canvas._ctx;
+  ctx.lineWidth = Math.max(6, Math.round(canvas._size.h / 22));
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#1f2937';
+}
+
+function drawSegment(canvas, from, to) {
+  const ctx = canvas._ctx;
+  penStyle(canvas);
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x + 0.1, to.y + 0.1);
+  ctx.stroke();
+}
+
+function redrawPad(canvas) {
+  const ctx = canvas._ctx;
+  const { w, h } = canvas._size;
+  ctx.clearRect(0, 0, w, h);
+  // ガイド(中央の点線)
   ctx.save();
   ctx.strokeStyle = '#e5e7eb';
   ctx.lineWidth = 1;
   ctx.setLineDash([5, 5]);
   ctx.beginPath();
-  ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h);
   ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2);
   ctx.stroke();
   ctx.restore();
+  // ストロークを描き直す
+  penStyle(canvas);
+  for (const stroke of canvas._strokes) {
+    ctx.beginPath();
+    ctx.moveTo(stroke[0].x, stroke[0].y);
+    if (stroke.length === 1) ctx.lineTo(stroke[0].x + 0.1, stroke[0].y + 0.1);
+    for (let i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i].x, stroke[i].y);
+    ctx.stroke();
+  }
 }
 
-function clearCanvas(canvas) {
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-  drawGuides(canvas, ctx);
+function padUndo(canvas) {
+  canvas._strokes.pop();
+  redrawPad(canvas);
+}
+
+function padClear(canvas) {
+  canvas._strokes = [];
+  redrawPad(canvas);
 }
 
 function finishSession(session, set) {
